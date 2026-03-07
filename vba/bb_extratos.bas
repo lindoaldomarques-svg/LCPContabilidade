@@ -21,11 +21,15 @@ Private Const AGENCIA As String = "1234"
 Private Const CONTA As String = "1234567"
 
 ' Escopo deve refletir o autorizado no BB Developer.
-Private Const OAUTH_SCOPE As String = "extrato.read"
+Private Const OAUTH_SCOPE As String = ""
 
 ' Opcional para cenários mTLS em máquinas Windows.
 ' Exemplo: "CURRENT_USER\MY\THUMBPRINT_DO_CERTIFICADO"
 Private Const CLIENT_CERT_LOCATION As String = ""
+
+Private Const CERT_PEM_PATH As String = "C:\Eticons\API-Malta\Prefeitura\pm_malta.pem"
+Private Const CERT_KEY_PATH As String = "C:\Eticons\API-Malta\Prefeitura\chave_privada2.key"
+Private Const CURL_EXE As String = "curl.exe"
 
 ' Timeout padrão (ms)
 Private Const HTTP_TIMEOUT_MS As Long = 60000
@@ -82,25 +86,41 @@ Private Function ObterTokenBB(ByRef erroDetalhado As String) As String
     Dim tokenUrl As String
     tokenUrl = MontarUrlToken()
 
-    Dim body As String
-    body = "grant_type=client_credentials"
-    If Len(Trim$(OAUTH_SCOPE)) > 0 Then
-        body = body & "&scope=" & UrlEncode(OAUTH_SCOPE)
-    End If
-
-    ' 1ª tentativa: padrão OAuth2 (Authorization: Basic)
     Dim status As Long
     Dim resp As String
-    status = ExecutarTokenRequest(tokenUrl, body, True, resp)
 
-    ' 2ª tentativa (fallback): alguns ambientes aceitam client_id/client_secret no body
+    Dim bodyComScope As String
+    bodyComScope = "grant_type=client_credentials"
+    If Len(Trim$(OAUTH_SCOPE)) > 0 Then
+        bodyComScope = bodyComScope & "&scope=" & UrlEncode(OAUTH_SCOPE)
+    End If
+
+    status = ExecutarTokenRequest(tokenUrl, bodyComScope, True, resp)
+
     If status < 200 Or status >= 300 Then
         Dim bodyFallback As String
-        bodyFallback = body & _
+        bodyFallback = bodyComScope & _
             "&client_id=" & UrlEncode(CLIENT_ID) & _
             "&client_secret=" & UrlEncode(CLIENT_SECRET)
 
         status = ExecutarTokenRequest(tokenUrl, bodyFallback, False, resp)
+    End If
+
+    ' Se escopo estiver inválido, tenta novamente sem scope
+    If EhErroInvalidScope(resp) Then
+        Dim bodySemScope As String
+        bodySemScope = "grant_type=client_credentials"
+
+        status = ExecutarTokenRequest(tokenUrl, bodySemScope, True, resp)
+
+        If status < 200 Or status >= 300 Then
+            Dim bodySemScopeFallback As String
+            bodySemScopeFallback = bodySemScope & _
+                "&client_id=" & UrlEncode(CLIENT_ID) & _
+                "&client_secret=" & UrlEncode(CLIENT_SECRET)
+
+            status = ExecutarTokenRequest(tokenUrl, bodySemScopeFallback, False, resp)
+        End If
     End If
 
     If status < 200 Or status >= 300 Then
@@ -136,8 +156,14 @@ Private Function ExecutarTokenRequest(ByVal url As String, ByVal body As String,
         Exit Function
     End If
 
-    ' Fallback para ambientes onde WinHttp gera "Erro 5 - Argumento inválido"
     status = ExecutarTokenRequestServerXmlHttp(url, body, usarBasicAuth, resposta)
+    If status <> 0 Then
+        ExecutarTokenRequest = status
+        Exit Function
+    End If
+
+    ' Fallback final via cURL com PEM + KEY
+    status = ExecutarTokenRequestCurl(url, body, usarBasicAuth, resposta)
     ExecutarTokenRequest = status
 End Function
 
@@ -198,6 +224,51 @@ TrataErro:
     resposta = resposta & IIf(Len(resposta) > 0, " | ", "") & _
                "ServerXMLHTTP erro " & Err.Number & ": " & Err.Description
     ExecutarTokenRequestServerXmlHttp = 0
+End Function
+
+Private Function ExecutarTokenRequestCurl(ByVal url As String, ByVal body As String, ByVal usarBasicAuth As Boolean, ByRef resposta As String) As Long
+    On Error GoTo TrataErro
+
+    If Len(Trim$(CERT_PEM_PATH)) = 0 Or Len(Trim$(CERT_KEY_PATH)) = 0 Then
+        resposta = resposta & IIf(Len(resposta) > 0, " | ", "") & "cURL não executado: caminho de PEM/KEY não informado."
+        ExecutarTokenRequestCurl = 0
+        Exit Function
+    End If
+
+    Dim q As String
+    q = Chr$(34)
+
+    Dim authHeader As String
+    authHeader = ""
+    If usarBasicAuth Then
+        authHeader = " -H " & q & "Authorization: Basic " & ObterBasicAuth() & q
+    End If
+
+    Dim cmd As String
+    cmd = "cmd /c " & q & CURL_EXE & _
+          " -s -i -X POST " & q & url & q & _
+          " -H " & q & "Content-Type: application/x-www-form-urlencoded" & q & _
+          " -H " & q & "Accept: application/json" & q & _
+          authHeader & _
+          " --cert " & q & CERT_PEM_PATH & q & _
+          " --key " & q & CERT_KEY_PATH & q & _
+          " --data " & q & body & q & q
+
+    Dim output As String
+    output = RunCommand(cmd)
+
+    ExecutarTokenRequestCurl = ParseHttpStatus(output)
+    resposta = ExtrairCorpoHttp(output)
+
+    If ExecutarTokenRequestCurl = 0 And Len(resposta) = 0 Then
+        resposta = "cURL sem retorno útil."
+    End If
+
+    Exit Function
+
+TrataErro:
+    resposta = resposta & IIf(Len(resposta) > 0, " | ", "") & "cURL erro " & Err.Number & ": " & Err.Description
+    ExecutarTokenRequestCurl = 0
 End Function
 
 Private Function ObterBasicAuth() As String
@@ -433,5 +504,70 @@ Private Function LimitarTexto(ByVal texto As String, ByVal limite As Long) As St
         LimitarTexto = texto
     Else
         LimitarTexto = Left$(texto, limite) & "..."
+    End If
+End Function
+
+
+Private Function EhErroInvalidScope(ByVal resposta As String) As Boolean
+    EhErroInvalidScope = (InStr(1, LCase$(resposta), "invalid_scope", vbTextCompare) > 0)
+End Function
+
+Private Function RunCommand(ByVal commandLine As String) As String
+    On Error GoTo TrataErro
+
+    Dim sh As Object
+    Dim exec As Object
+    Set sh = CreateObject("WScript.Shell")
+    Set exec = sh.Exec(commandLine)
+
+    Do While exec.Status = 0
+        DoEvents
+    Loop
+
+    Dim outTxt As String
+    Dim errTxt As String
+
+    outTxt = exec.StdOut.ReadAll
+    errTxt = exec.StdErr.ReadAll
+
+    RunCommand = outTxt
+    If Len(errTxt) > 0 Then
+        RunCommand = RunCommand & vbCrLf & errTxt
+    End If
+    Exit Function
+
+TrataErro:
+    RunCommand = ""
+End Function
+
+Private Function ParseHttpStatus(ByVal httpRaw As String) As Long
+    On Error GoTo Falha
+
+    Dim re As Object
+    Set re = CreateObject("VBScript.RegExp")
+    re.Global = False
+    re.IgnoreCase = True
+    re.Pattern = "HTTP/[0-9.]+\s+([0-9]{3})"
+
+    Dim ms As Object
+    Set ms = re.Execute(httpRaw)
+    If ms.Count > 0 Then
+        ParseHttpStatus = CLng(ms(0).SubMatches(0))
+    Else
+        ParseHttpStatus = 0
+    End If
+    Exit Function
+
+Falha:
+    ParseHttpStatus = 0
+End Function
+
+Private Function ExtrairCorpoHttp(ByVal httpRaw As String) As String
+    Dim p As Long
+    p = InStrRev(httpRaw, vbCrLf & vbCrLf)
+    If p > 0 Then
+        ExtrairCorpoHttp = Mid$(httpRaw, p + 4)
+    Else
+        ExtrairCorpoHttp = httpRaw
     End If
 End Function
