@@ -10,9 +10,11 @@ Option Explicit
 Private Const BB_AUTH_URL As String = "https://oauth.bb.com.br/oauth/token"
 Private Const BB_EXTRATO_URL As String = "https://api.bb.com.br/extratos/v1/contas/{agencia}/{conta}/lancamentos"
 
-Private Const CLIENT_ID As String = "SEU_CLIENT_ID"
-Private Const CLIENT_SECRET As String = "SEU_CLIENT_SECRET"
-Private Const APP_KEY As String = "SUA_APP_KEY"
+Private Const CLIENT_ID As String = "eyJpZCI6IjhiM2ZiNmQtIiwiY29kaWdvUHVibGljYWRvciI6MCwiY29kaWdvU29mdHdhcmUiOjE0NjY0Mywic2VxdWVuY2lhbEluc3RhbGFjYW8iOjF9"
+Private Const CLIENT_SECRET As String = "eyJpZCI6ImNhMmZkMDQtMjc3ZS00MmM3LWE1MjctZmNiZTNmIiwiY29kaWdvUHVibGljYWRvciI6MCwiY29kaWdvU29mdHdhcmUiOjE0NjY0Mywic2VxdWVuY2lhbEluc3RhbGFjYW8iOjEsInNlcXVlbmNpYWxDcmVkZW5jaWFsIjo3LCJhbWJpZW50ZSI6InByb2R1Y2FvIiwiaWF0IjoxNzcxNTA1MzgzNTY3fQ"
+Private Const APP_KEY As String = "5aac0c22c1574279826860882d4b3c72"
+
+Private Const PRECOMPUTED_BASIC As String = "ZXlKcFpDSTZJamhpTTJaaU5tUXRJaXdpWTI5a2FXZHZVSFZpYkdsallXUnZjaUk2TUN3aVkyOWthV2R2VTI5bWRIZGhjbVVpT2pFME5qWTBNeXdpYzJWeGRXVnVZMmxoYkVsdWMzUmhiR0ZqWVc4aU9qRjk6ZXlKcFpDSTZJbU5oTW1aa01EUXRNamMzWlMwME1tTTNMV0UxTWpjdFptTmlaVE5tSWl3aVkyOWthV2R2VUhWaWJHbGpZV1J2Y2lJNk1Dd2lZMjlrYVdkdlUyOW1kSGRoY21VaU9qRTBOalkwTXl3aWMyVnhkV1Z1WTJsaGJFbHVjM1JoYkdGallXOGlPakVzSW5ObGNYVmxibU5wWVd4RGNtVmtaVzVqYVdGc0lqbzNMQ0poYldKcFpXNTBaU0k2SW5CeWIyUjFZMkZ2SWl3aWFXRjBJam94TnpjeE5UQTFNemd6TlRZM2ZR"
 
 ' Formato recomendado para agência/conta sem máscara.
 Private Const AGENCIA As String = "1234"
@@ -126,12 +128,26 @@ TrataErro:
 End Function
 
 Private Function ExecutarTokenRequest(ByVal url As String, ByVal body As String, ByVal usarBasicAuth As Boolean, ByRef resposta As String) As Long
+    Dim status As Long
+
+    status = ExecutarTokenRequestWinHttp(url, body, usarBasicAuth, resposta)
+    If status <> 0 Then
+        ExecutarTokenRequest = status
+        Exit Function
+    End If
+
+    ' Fallback para ambientes onde WinHttp gera "Erro 5 - Argumento inválido"
+    status = ExecutarTokenRequestServerXmlHttp(url, body, usarBasicAuth, resposta)
+    ExecutarTokenRequest = status
+End Function
+
+Private Function ExecutarTokenRequestWinHttp(ByVal url As String, ByVal body As String, ByVal usarBasicAuth As Boolean, ByRef resposta As String) As Long
     On Error GoTo TrataErro
 
     Dim http As Object
     Set http = CreateObject("WinHttp.WinHttpRequest.5.1")
 
-    ConfigurarHttp http
+    ConfigurarHttpWinHttp http
 
     http.Open "POST", url, False
 
@@ -143,18 +159,53 @@ Private Function ExecutarTokenRequest(ByVal url As String, ByVal body As String,
     http.SetRequestHeader "Accept", "application/json"
 
     If usarBasicAuth Then
-        http.SetRequestHeader "Authorization", "Basic " & Base64Encode(CLIENT_ID & ":" & CLIENT_SECRET)
+        http.SetRequestHeader "Authorization", "Basic " & ObterBasicAuth()
     End If
 
     http.Send body
 
     resposta = http.ResponseText
-    ExecutarTokenRequest = http.Status
+    ExecutarTokenRequestWinHttp = http.Status
     Exit Function
 
 TrataErro:
-    resposta = "Erro de transporte: " & Err.Number & " - " & Err.Description
-    ExecutarTokenRequest = 0
+    resposta = "WinHttp erro " & Err.Number & ": " & Err.Description
+    ExecutarTokenRequestWinHttp = 0
+End Function
+
+Private Function ExecutarTokenRequestServerXmlHttp(ByVal url As String, ByVal body As String, ByVal usarBasicAuth As Boolean, ByRef resposta As String) As Long
+    On Error GoTo TrataErro
+
+    Dim http As Object
+    Set http = CreateObject("MSXML2.ServerXMLHTTP.6.0")
+
+    http.setTimeouts HTTP_TIMEOUT_MS, HTTP_TIMEOUT_MS, HTTP_TIMEOUT_MS, HTTP_TIMEOUT_MS
+    http.Open "POST", url, False
+    http.setRequestHeader "Content-Type", "application/x-www-form-urlencoded"
+    http.setRequestHeader "Accept", "application/json"
+
+    If usarBasicAuth Then
+        http.setRequestHeader "Authorization", "Basic " & ObterBasicAuth()
+    End If
+
+    http.send body
+
+    resposta = http.responseText
+    ExecutarTokenRequestServerXmlHttp = CLng(http.status)
+    Exit Function
+
+TrataErro:
+    resposta = resposta & IIf(Len(resposta) > 0, " | ", "") & _
+               "ServerXMLHTTP erro " & Err.Number & ": " & Err.Description
+    ExecutarTokenRequestServerXmlHttp = 0
+End Function
+
+Private Function ObterBasicAuth() As String
+    If Len(Trim$(PRECOMPUTED_BASIC)) > 0 Then
+        ObterBasicAuth = PRECOMPUTED_BASIC
+    Else
+        ObterBasicAuth = Base64Encode(CLIENT_ID & ":" & CLIENT_SECRET)
+    End If
 End Function
 
 Private Function MontarUrlToken() As String
@@ -181,11 +232,38 @@ Private Function BuscarExtratoBB(ByVal accessToken As String, ByVal dataInicio A
     url = url & "&dataInicioSolicitacao=" & UrlEncode(dataInicio)
     url = url & "&dataFimSolicitacao=" & UrlEncode(dataFim)
 
+    Dim resp As String
+    Dim status As Long
+
+    status = ExecutarGetWinHttp(url, accessToken, resp)
+    If status = 0 Then
+        status = ExecutarGetServerXmlHttp(url, accessToken, resp)
+    End If
+
+    If status < 200 Or status >= 300 Then
+        erroDetalhado = "HTTP " & CStr(status) & " na API de extrato." & vbCrLf & _
+                        "URL: " & url & vbCrLf & _
+                        "Resposta: " & LimitarTexto(resp, 600)
+        BuscarExtratoBB = ""
+        Exit Function
+    End If
+
+    erroDetalhado = ""
+    BuscarExtratoBB = resp
+    Exit Function
+
+TrataErro:
+    erroDetalhado = "Erro VBA na API de extrato: " & Err.Number & " - " & Err.Description
+    BuscarExtratoBB = ""
+End Function
+
+Private Function ExecutarGetWinHttp(ByVal url As String, ByVal accessToken As String, ByRef resposta As String) As Long
+    On Error GoTo TrataErro
+
     Dim http As Object
     Set http = CreateObject("WinHttp.WinHttpRequest.5.1")
 
-    ConfigurarHttp http
-
+    ConfigurarHttpWinHttp http
     http.Open "GET", url, False
 
     If Len(Trim$(CLIENT_CERT_LOCATION)) > 0 Then
@@ -194,27 +272,40 @@ Private Function BuscarExtratoBB(ByVal accessToken As String, ByVal dataInicio A
 
     http.SetRequestHeader "Authorization", "Bearer " & accessToken
     http.SetRequestHeader "Accept", "application/json"
-
     http.Send
 
-    If http.Status < 200 Or http.Status >= 300 Then
-        erroDetalhado = "HTTP " & CStr(http.Status) & " na API de extrato." & vbCrLf & _
-                        "URL: " & url & vbCrLf & _
-                        "Resposta: " & LimitarTexto(http.ResponseText, 600)
-        BuscarExtratoBB = ""
-        Exit Function
-    End If
-
-    erroDetalhado = ""
-    BuscarExtratoBB = http.ResponseText
+    resposta = http.ResponseText
+    ExecutarGetWinHttp = http.Status
     Exit Function
 
 TrataErro:
-    erroDetalhado = "Erro VBA na API de extrato: " & Err.Number & " - " & Err.Description
-    BuscarExtratoBB = ""
+    resposta = "WinHttp erro " & Err.Number & ": " & Err.Description
+    ExecutarGetWinHttp = 0
 End Function
 
-Private Sub ConfigurarHttp(ByVal http As Object)
+Private Function ExecutarGetServerXmlHttp(ByVal url As String, ByVal accessToken As String, ByRef resposta As String) As Long
+    On Error GoTo TrataErro
+
+    Dim http As Object
+    Set http = CreateObject("MSXML2.ServerXMLHTTP.6.0")
+
+    http.setTimeouts HTTP_TIMEOUT_MS, HTTP_TIMEOUT_MS, HTTP_TIMEOUT_MS, HTTP_TIMEOUT_MS
+    http.Open "GET", url, False
+    http.setRequestHeader "Authorization", "Bearer " & accessToken
+    http.setRequestHeader "Accept", "application/json"
+    http.send
+
+    resposta = http.responseText
+    ExecutarGetServerXmlHttp = CLng(http.status)
+    Exit Function
+
+TrataErro:
+    resposta = resposta & IIf(Len(resposta) > 0, " | ", "") & _
+               "ServerXMLHTTP erro " & Err.Number & ": " & Err.Description
+    ExecutarGetServerXmlHttp = 0
+End Function
+
+Private Sub ConfigurarHttpWinHttp(ByVal http As Object)
     On Error Resume Next
     http.SetTimeouts HTTP_TIMEOUT_MS, HTTP_TIMEOUT_MS, HTTP_TIMEOUT_MS, HTTP_TIMEOUT_MS
 
