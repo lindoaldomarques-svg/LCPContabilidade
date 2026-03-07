@@ -1,6 +1,6 @@
 # VBA - API Extratos Banco do Brasil
 
-Este repositório contém um módulo VBA pronto para baixar extratos do Banco do Brasil via API.
+Este repositório contém um módulo VBA para baixar extratos do Banco do Brasil via API.
 
 ## Arquivo principal
 
@@ -21,7 +21,17 @@ Este repositório contém um módulo VBA pronto para baixar extratos do Banco do
 4. Execute a macro `BaixarExtratoBB`.
 5. O JSON de retorno será salvo na aba `Extrato_BB_JSON`.
 
+## Correção aplicada para erro de token OAuth2
+
+Se antes aparecia a mensagem **"Não foi possível obter token OAuth2"**, o módulo agora:
+
+- Envia `gw-dev-app-key` também na URL de token.
+- Faz tentativa padrão com `Authorization: Basic` e fallback com `client_id/client_secret` no corpo.
+- Força TLS 1.2 via WinHTTP.
+- Exibe detalhes do erro (status HTTP e resposta da API) para facilitar diagnóstico.
+
 ## Observações
 
 - Valide no portal do BB os endpoints exatos e os parâmetros do seu convênio.
-- Em ambiente produtivo, recomenda-se usar um parser JSON robusto (ex.: VBA-JSON) para quebrar os lançamentos em colunas.
+- Alguns convênios exigem certificado cliente (mTLS) também no token.
+- Em ambiente produtivo, recomenda-se usar parser JSON robusto (ex.: VBA-JSON) para quebrar lançamentos em colunas.

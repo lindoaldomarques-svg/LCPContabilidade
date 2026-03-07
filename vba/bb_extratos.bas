@@ -4,16 +4,6 @@ Option Explicit
 ' ================================================================
 ' Módulo VBA para consumir a API de Extratos do Banco do Brasil
 ' e gravar o resultado em uma planilha do Excel.
-'
-' Pré-requisitos comuns da API BB:
-' 1) Aplicação cadastrada no Developer BB.
-' 2) OAuth2 (Client Credentials) habilitado.
-' 3) Certificado cliente (mTLS), quando exigido pelo convênio.
-' 4) Escopos/permissões para endpoint de extratos.
-'
-' Observação importante:
-' - Os endpoints abaixo são exemplos de URL. Valide no portal do BB
-'   os caminhos exatos do seu produto/versão e ambiente.
 ' ================================================================
 
 ' ====== CONFIGURAÇÃO ======
@@ -32,8 +22,11 @@ Private Const CONTA As String = "1234567"
 Private Const OAUTH_SCOPE As String = "extrato.read"
 
 ' Opcional para cenários mTLS em máquinas Windows.
-' Exemplo: "CURRENT_USER\\MY\\THUMBPRINT_DO_CERTIFICADO"
+' Exemplo: "CURRENT_USER\MY\THUMBPRINT_DO_CERTIFICADO"
 Private Const CLIENT_CERT_LOCATION As String = ""
+
+' Timeout padrão (ms)
+Private Const HTTP_TIMEOUT_MS As Long = 60000
 
 ' ====== API PÚBLICA ======
 Public Sub BaixarExtratoBB()
@@ -54,16 +47,20 @@ Public Sub BaixarExtratoBB()
     End If
 
     Dim token As String
-    token = ObterTokenBB()
+    Dim authErro As String
+
+    token = ObterTokenBB(authErro)
     If Len(token) = 0 Then
-        MsgBox "Não foi possível obter token OAuth2.", vbCritical
+        MsgBox "Não foi possível obter token OAuth2." & vbCrLf & vbCrLf & authErro, vbCritical
         Exit Sub
     End If
 
     Dim json As String
-    json = BuscarExtratoBB(token, dtInicio, dtFim)
+    Dim extratoErro As String
+
+    json = BuscarExtratoBB(token, dtInicio, dtFim, extratoErro)
     If Len(json) = 0 Then
-        MsgBox "Resposta vazia da API de extratos.", vbExclamation
+        MsgBox "Falha ao consultar extrato." & vbCrLf & vbCrLf & extratoErro, vbCritical
         Exit Sub
     End If
 
@@ -77,58 +74,117 @@ TrataErro:
 End Sub
 
 ' ====== OAUTH2 ======
-Private Function ObterTokenBB() As String
+Private Function ObterTokenBB(ByRef erroDetalhado As String) As String
+    On Error GoTo TrataErro
+
+    Dim tokenUrl As String
+    tokenUrl = MontarUrlToken()
+
+    Dim body As String
+    body = "grant_type=client_credentials"
+    If Len(Trim$(OAUTH_SCOPE)) > 0 Then
+        body = body & "&scope=" & UrlEncode(OAUTH_SCOPE)
+    End If
+
+    ' 1ª tentativa: padrão OAuth2 (Authorization: Basic)
+    Dim status As Long
+    Dim resp As String
+    status = ExecutarTokenRequest(tokenUrl, body, True, resp)
+
+    ' 2ª tentativa (fallback): alguns ambientes aceitam client_id/client_secret no body
+    If status < 200 Or status >= 300 Then
+        Dim bodyFallback As String
+        bodyFallback = body & _
+            "&client_id=" & UrlEncode(CLIENT_ID) & _
+            "&client_secret=" & UrlEncode(CLIENT_SECRET)
+
+        status = ExecutarTokenRequest(tokenUrl, bodyFallback, False, resp)
+    End If
+
+    If status < 200 Or status >= 300 Then
+        erroDetalhado = "HTTP " & CStr(status) & " no OAuth." & vbCrLf & _
+                        "URL: " & tokenUrl & vbCrLf & _
+                        "Resposta: " & LimitarTexto(resp, 600)
+        ObterTokenBB = ""
+        Exit Function
+    End If
+
+    ObterTokenBB = JsonGetString(resp, "access_token")
+
+    If Len(ObterTokenBB) = 0 Then
+        erroDetalhado = "OAuth retornou sucesso, porém sem access_token." & vbCrLf & _
+                        "Resposta: " & LimitarTexto(resp, 600)
+        Exit Function
+    End If
+
+    erroDetalhado = ""
+    Exit Function
+
+TrataErro:
+    erroDetalhado = "Erro VBA no OAuth: " & Err.Number & " - " & Err.Description
+    ObterTokenBB = ""
+End Function
+
+Private Function ExecutarTokenRequest(ByVal url As String, ByVal body As String, ByVal usarBasicAuth As Boolean, ByRef resposta As String) As Long
     On Error GoTo TrataErro
 
     Dim http As Object
     Set http = CreateObject("WinHttp.WinHttpRequest.5.1")
 
-    http.Open "POST", BB_AUTH_URL, False
+    ConfigurarHttp http
+
+    http.Open "POST", url, False
 
     If Len(Trim$(CLIENT_CERT_LOCATION)) > 0 Then
         http.SetClientCertificate CLIENT_CERT_LOCATION
     End If
 
     http.SetRequestHeader "Content-Type", "application/x-www-form-urlencoded"
-    http.SetRequestHeader "Authorization", "Basic " & Base64Encode(CLIENT_ID & ":" & CLIENT_SECRET)
+    http.SetRequestHeader "Accept", "application/json"
 
-    Dim body As String
-    body = "grant_type=client_credentials"
-
-    If Len(Trim$(OAUTH_SCOPE)) > 0 Then
-        body = body & "&scope=" & UrlEncode(OAUTH_SCOPE)
+    If usarBasicAuth Then
+        http.SetRequestHeader "Authorization", "Basic " & Base64Encode(CLIENT_ID & ":" & CLIENT_SECRET)
     End If
 
     http.Send body
 
-    If http.Status < 200 Or http.Status >= 300 Then
-        Debug.Print "Falha OAuth2: "; http.Status; " - "; http.ResponseText
-        ObterTokenBB = ""
-        Exit Function
-    End If
-
-    ObterTokenBB = JsonGetString(http.ResponseText, "access_token")
+    resposta = http.ResponseText
+    ExecutarTokenRequest = http.Status
     Exit Function
 
 TrataErro:
-    Debug.Print "Erro ObterTokenBB: "; Err.Number; " - "; Err.Description
-    ObterTokenBB = ""
+    resposta = "Erro de transporte: " & Err.Number & " - " & Err.Description
+    ExecutarTokenRequest = 0
+End Function
+
+Private Function MontarUrlToken() As String
+    If InStr(1, BB_AUTH_URL, "gw-dev-app-key=", vbTextCompare) > 0 Then
+        MontarUrlToken = BB_AUTH_URL
+        Exit Function
+    End If
+
+    If InStr(1, BB_AUTH_URL, "?", vbBinaryCompare) > 0 Then
+        MontarUrlToken = BB_AUTH_URL & "&gw-dev-app-key=" & UrlEncode(APP_KEY)
+    Else
+        MontarUrlToken = BB_AUTH_URL & "?gw-dev-app-key=" & UrlEncode(APP_KEY)
+    End If
 End Function
 
 ' ====== EXTRATOS ======
-Private Function BuscarExtratoBB(ByVal accessToken As String, ByVal dataInicio As String, ByVal dataFim As String) As String
+Private Function BuscarExtratoBB(ByVal accessToken As String, ByVal dataInicio As String, ByVal dataFim As String, ByRef erroDetalhado As String) As String
     On Error GoTo TrataErro
 
     Dim url As String
     url = Replace(BB_EXTRATO_URL, "{agencia}", UrlEncode(AGENCIA))
     url = Replace(url, "{conta}", UrlEncode(CONTA))
-
     url = url & "?gw-dev-app-key=" & UrlEncode(APP_KEY)
     url = url & "&dataInicioSolicitacao=" & UrlEncode(dataInicio)
     url = url & "&dataFimSolicitacao=" & UrlEncode(dataFim)
 
     Dim http As Object
     Set http = CreateObject("WinHttp.WinHttpRequest.5.1")
+
+    ConfigurarHttp http
 
     http.Open "GET", url, False
 
@@ -142,18 +198,31 @@ Private Function BuscarExtratoBB(ByVal accessToken As String, ByVal dataInicio A
     http.Send
 
     If http.Status < 200 Or http.Status >= 300 Then
-        Debug.Print "Falha Extrato: "; http.Status; " - "; http.ResponseText
+        erroDetalhado = "HTTP " & CStr(http.Status) & " na API de extrato." & vbCrLf & _
+                        "URL: " & url & vbCrLf & _
+                        "Resposta: " & LimitarTexto(http.ResponseText, 600)
         BuscarExtratoBB = ""
         Exit Function
     End If
 
+    erroDetalhado = ""
     BuscarExtratoBB = http.ResponseText
     Exit Function
 
 TrataErro:
-    Debug.Print "Erro BuscarExtratoBB: "; Err.Number; " - "; Err.Description
+    erroDetalhado = "Erro VBA na API de extrato: " & Err.Number & " - " & Err.Description
     BuscarExtratoBB = ""
 End Function
+
+Private Sub ConfigurarHttp(ByVal http As Object)
+    On Error Resume Next
+    http.SetTimeouts HTTP_TIMEOUT_MS, HTTP_TIMEOUT_MS, HTTP_TIMEOUT_MS, HTTP_TIMEOUT_MS
+
+    ' Força TLS 1.2 no WinHTTP (0x800)
+    http.Option(9) = 2048
+    http.Option(6) = True ' habilita redirects
+    On Error GoTo 0
+End Sub
 
 ' ====== SAÍDA ======
 Private Sub GravarJsonEmPlanilha(ByVal json As String, ByVal nomeAba As String)
@@ -247,25 +316,31 @@ Falha:
     IsIsoDate = False
 End Function
 
-' Parser mínimo para extração de string de uma chave JSON simples.
-' Em produção, prefira um parser JSON completo (ex.: VBA-JSON).
 Private Function JsonGetString(ByVal json As String, ByVal key As String) As String
-    Dim token As String
-    token = """" & key & """"
+    On Error GoTo Fim
 
-    Dim p As Long
-    p = InStr(1, json, token, vbTextCompare)
-    If p = 0 Then Exit Function
+    Dim re As Object
+    Set re = CreateObject("VBScript.RegExp")
 
-    p = InStr(p + Len(token), json, ":", vbTextCompare)
-    If p = 0 Then Exit Function
+    re.Global = False
+    re.IgnoreCase = True
+    re.MultiLine = True
+    re.Pattern = """" & key & """" & "\s*:\s*""([^""]+)"""
 
-    p = InStr(p + 1, json, """", vbTextCompare)
-    If p = 0 Then Exit Function
+    Dim matches As Object
+    Set matches = re.Execute(json)
 
-    Dim q As Long
-    q = InStr(p + 1, json, """", vbTextCompare)
-    If q = 0 Then Exit Function
+    If matches.Count > 0 Then
+        JsonGetString = matches(0).SubMatches(0)
+    End If
 
-    JsonGetString = Mid$(json, p + 1, q - p - 1)
+Fim:
+End Function
+
+Private Function LimitarTexto(ByVal texto As String, ByVal limite As Long) As String
+    If Len(texto) <= limite Then
+        LimitarTexto = texto
+    Else
+        LimitarTexto = Left$(texto, limite) & "..."
+    End If
 End Function
